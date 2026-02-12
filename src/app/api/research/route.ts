@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import * as cheerio from "cheerio";
 
+export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
+export const maxDuration = 10;
+
 interface ResearchResult {
   companyName: string;
   website: string;
@@ -44,13 +48,14 @@ const CAREERS_PATHS = ["/careers", "/jobs", "/join-us", "/open-positions"];
 
 async function fetchWithTimeout(
   url: string,
-  timeoutMs = 5000
+  timeoutMs = 3000
 ): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       signal: controller.signal,
+      cache: "no-store",
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -120,7 +125,7 @@ async function findCareersPage(
   const pathChecks = CAREERS_PATHS.map(async (path) => {
     try {
       const url = new URL(path, baseUrl).href;
-      const res = await fetchWithTimeout(url, 4000);
+      const res = await fetchWithTimeout(url, 3000);
       if (res.ok) {
         const finalDomain = new URL(res.url).hostname.replace(/^www\./, "");
         if (finalDomain === baseDomain || detectAtsFromUrl(res.url)) {
@@ -135,7 +140,7 @@ async function findCareersPage(
 
   const homepageCheck = (async () => {
     try {
-      const res = await fetchWithTimeout(baseUrl, 4000);
+      const res = await fetchWithTimeout(baseUrl, 3000);
       if (res.ok) {
         return await res.text();
       }
@@ -177,7 +182,7 @@ async function findCareersPage(
         continue;
       }
       try {
-        const res = await fetchWithTimeout(fullUrl, 4000);
+        const res = await fetchWithTimeout(fullUrl, 3000);
         if (res.ok) {
           return { url: res.url, html: await res.text() };
         }
@@ -223,7 +228,7 @@ async function findCareersPage(
         continue;
       }
       try {
-        const res = await fetchWithTimeout(fullUrl, 4000);
+        const res = await fetchWithTimeout(fullUrl, 3000);
         if (res.ok) {
           const finalDomain = new URL(res.url).hostname.replace(/^www\./, "");
           if (finalDomain === baseDomain || detectAtsFromUrl(res.url)) {
@@ -256,7 +261,7 @@ async function countJobsViaApi(
       try {
         const res = await fetchWithTimeout(
           `https://boards-api.greenhouse.io/v1/boards/${slug}/jobs`,
-          4000
+          3000
         );
         if (res.ok) {
           const data = await res.json();
@@ -276,7 +281,7 @@ async function countJobsViaApi(
     try {
       const res = await fetchWithTimeout(
         `https://api.ashbyhq.com/posting-api/job-board/${slug}`,
-        4000
+        3000
       );
       if (res.ok) {
         const data = await res.json();
@@ -295,7 +300,7 @@ async function countJobsViaApi(
     try {
       const res = await fetchWithTimeout(
         `https://api.lever.co/v0/postings/${slug}?mode=json`,
-        4000
+        3000
       );
       if (res.ok) {
         const data = await res.json();
@@ -425,7 +430,11 @@ export async function POST(request: NextRequest) {
     const baseUrl = `${parsedUrl.protocol}//${parsedUrl.hostname}`;
     const companyName = extractCompanyName(normalizedUrl);
 
+    console.log(`[research] Starting research for ${baseUrl} (${companyName})`);
+
     const careersPage = await findCareersPage(baseUrl);
+
+    console.log(`[research] Careers page: ${careersPage ? careersPage.url : "NOT FOUND"} (html length: ${careersPage?.html?.length ?? 0})`);
 
     let atsDetected = "Unknown / Custom ATS";
     let liveRoles: number | null = null;
@@ -459,6 +468,8 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    console.log(`[research] ATS detected: ${atsDetected}, careersUrl: ${careersUrl}`);
+
     // Try API-based job counting (most reliable)
     if (atsDetected !== "Unknown / Custom ATS") {
       liveRoles = await countJobsViaApi(
@@ -472,6 +483,8 @@ export async function POST(request: NextRequest) {
     if (liveRoles === null && careersPage?.html) {
       liveRoles = countJobsFromHtml(careersPage.html, atsDetected);
     }
+
+    console.log(`[research] Live roles: ${liveRoles}`);
 
     const linkedinSearchUrl = buildLinkedInSearchUrl(companyName);
 

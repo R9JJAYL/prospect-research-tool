@@ -39,22 +39,12 @@ const ATS_PATTERNS: { name: string; patterns: RegExp[] }[] = [
   { name: "Breezy HR", patterns: [/breezy\.hr/i] },
 ];
 
-const CAREERS_PATHS = [
-  "/careers",
-  "/jobs",
-  "/join",
-  "/join-us",
-  "/work-with-us",
-  "/open-positions",
-  "/opportunities",
-  "/hiring",
-  "/career",
-  "/vacancies",
-];
+// Only the most common paths — tried in parallel
+const CAREERS_PATHS = ["/careers", "/jobs", "/join-us", "/open-positions"];
 
 async function fetchWithTimeout(
   url: string,
-  timeoutMs = 8000
+  timeoutMs = 5000
 ): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -126,100 +116,124 @@ async function findCareersPage(
 ): Promise<{ url: string; html: string } | null> {
   const baseDomain = new URL(baseUrl).hostname.replace(/^www\./, "");
 
-  // Step 1: Try common careers paths directly (fast and reliable)
-  for (const path of CAREERS_PATHS) {
+  // Run homepage fetch AND common path checks in parallel
+  const pathChecks = CAREERS_PATHS.map(async (path) => {
     try {
       const url = new URL(path, baseUrl).href;
-      const res = await fetchWithTimeout(url);
+      const res = await fetchWithTimeout(url, 4000);
       if (res.ok) {
         const finalDomain = new URL(res.url).hostname.replace(/^www\./, "");
-        // Only accept if it stayed on the same domain or went to a known ATS
         if (finalDomain === baseDomain || detectAtsFromUrl(res.url)) {
           return { url: res.url, html: await res.text() };
         }
       }
     } catch {
-      continue;
+      // ignore
     }
+    return null;
+  });
+
+  const homepageCheck = (async () => {
+    try {
+      const res = await fetchWithTimeout(baseUrl, 4000);
+      if (res.ok) {
+        return await res.text();
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  })();
+
+  // Wait for all in parallel
+  const [pathResults, homepageHtml] = await Promise.all([
+    Promise.all(pathChecks),
+    homepageCheck,
+  ]);
+
+  // Return first successful path match (prefer /careers > /jobs > etc)
+  for (const result of pathResults) {
+    if (result) return result;
   }
 
-  // Step 2: Scrape homepage for ATS links and careers links
-  try {
-    const homepageRes = await fetchWithTimeout(baseUrl);
-    if (homepageRes.ok) {
-      const html = await homepageRes.text();
-      const $ = cheerio.load(html);
+  // If no direct path worked, parse homepage for ATS or careers links
+  if (homepageHtml) {
+    const $ = cheerio.load(homepageHtml);
 
-      // First priority: find direct ATS links in iframes or anchor tags
-      const atsLinks: string[] = [];
-      $("iframe[src], a[href]").each((_, el) => {
-        const src = $(el).attr("src") || $(el).attr("href") || "";
-        if (detectAtsFromUrl(src)) {
-          atsLinks.push(src);
-        }
-      });
-
-      for (const link of atsLinks.slice(0, 3)) {
-        let fullUrl: string;
-        try {
-          fullUrl = new URL(link, baseUrl).href;
-        } catch {
-          continue;
-        }
-        try {
-          const res = await fetchWithTimeout(fullUrl);
-          if (res.ok) {
-            return { url: res.url, html: await res.text() };
-          }
-        } catch {
-          return { url: fullUrl, html: "" };
-        }
+    // Priority 1: direct ATS links
+    const atsLinks: string[] = [];
+    $("iframe[src], a[href]").each((_, el) => {
+      const src = $(el).attr("src") || $(el).attr("href") || "";
+      if (detectAtsFromUrl(src)) {
+        atsLinks.push(src);
       }
+    });
 
-      // Second priority: find links with career-related href paths
-      const careersLinks: string[] = [];
-      $("a[href]").each((_, el) => {
-        const href = $(el).attr("href") || "";
-        if (/\/(careers|jobs|open-positions|openings|vacancies)(\/|$|\?)/i.test(href)) {
-          careersLinks.push(href);
+    for (const link of atsLinks.slice(0, 2)) {
+      let fullUrl: string;
+      try {
+        fullUrl = new URL(link, baseUrl).href;
+      } catch {
+        continue;
+      }
+      try {
+        const res = await fetchWithTimeout(fullUrl, 4000);
+        if (res.ok) {
+          return { url: res.url, html: await res.text() };
         }
-      });
-
-      // Third priority: links with career-related anchor text (but only if href looks plausible)
-      $("a[href]").each((_, el) => {
-        const href = $(el).attr("href") || "";
-        const text = $(el).text().trim().toLowerCase();
-        if (
-          (text === "careers" || text === "jobs" || text === "work with us" || text === "join us") &&
-          href.length > 1 &&
-          !careersLinks.includes(href)
-        ) {
-          careersLinks.push(href);
-        }
-      });
-
-      for (const link of careersLinks.slice(0, 5)) {
-        let fullUrl: string;
-        try {
-          fullUrl = new URL(link, baseUrl).href;
-        } catch {
-          continue;
-        }
-        try {
-          const res = await fetchWithTimeout(fullUrl);
-          if (res.ok) {
-            const finalDomain = new URL(res.url).hostname.replace(/^www\./, "");
-            if (finalDomain === baseDomain || detectAtsFromUrl(res.url)) {
-              return { url: res.url, html: await res.text() };
-            }
-          }
-        } catch {
-          continue;
-        }
+      } catch {
+        return { url: fullUrl, html: "" };
       }
     }
-  } catch {
-    // Homepage fetch failed
+
+    // Priority 2: career-related href paths
+    const careersLinks: string[] = [];
+    $("a[href]").each((_, el) => {
+      const href = $(el).attr("href") || "";
+      if (
+        /\/(careers|jobs|open-positions|openings|vacancies)(\/|$|\?)/i.test(
+          href
+        )
+      ) {
+        careersLinks.push(href);
+      }
+    });
+
+    // Priority 3: career-related anchor text
+    $("a[href]").each((_, el) => {
+      const href = $(el).attr("href") || "";
+      const text = $(el).text().trim().toLowerCase();
+      if (
+        (text === "careers" ||
+          text === "jobs" ||
+          text === "work with us" ||
+          text === "join us") &&
+        href.length > 1 &&
+        !careersLinks.includes(href)
+      ) {
+        careersLinks.push(href);
+      }
+    });
+
+    for (const link of careersLinks.slice(0, 3)) {
+      let fullUrl: string;
+      try {
+        fullUrl = new URL(link, baseUrl).href;
+      } catch {
+        continue;
+      }
+      try {
+        const res = await fetchWithTimeout(fullUrl, 4000);
+        if (res.ok) {
+          const finalDomain = new URL(res.url).hostname.replace(/^www\./, "");
+          if (finalDomain === baseDomain || detectAtsFromUrl(res.url)) {
+            return { url: res.url, html: await res.text() };
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
   }
 
   return null;
@@ -230,16 +244,19 @@ async function countJobsViaApi(
   atsName: string,
   companySlug: string
 ): Promise<number | null> {
-  // Greenhouse has a public JSON API
   if (atsName === "Greenhouse") {
-    // Extract board token from URL like boards.greenhouse.io/COMPANY or job-boards.greenhouse.io/COMPANY
     const ghMatch = careersUrl.match(
       /(?:boards|job-boards)\.greenhouse\.io\/([^/?#]+)/i
     );
-    if (ghMatch) {
+    const slugs = ghMatch
+      ? [ghMatch[1], companySlug.toLowerCase()]
+      : [companySlug.toLowerCase()];
+
+    for (const slug of [...new Set(slugs)]) {
       try {
         const res = await fetchWithTimeout(
-          `https://boards-api.greenhouse.io/v1/boards/${ghMatch[1]}/jobs`
+          `https://boards-api.greenhouse.io/v1/boards/${slug}/jobs`,
+          4000
         );
         if (res.ok) {
           const data = await res.json();
@@ -251,31 +268,15 @@ async function countJobsViaApi(
         // Fall through
       }
     }
-    // Try with company slug as board token
-    try {
-      const res = await fetchWithTimeout(
-        `https://boards-api.greenhouse.io/v1/boards/${companySlug.toLowerCase()}/jobs`
-      );
-      if (res.ok) {
-        const data = await res.json();
-        if (data.jobs && Array.isArray(data.jobs)) {
-          return data.jobs.length;
-        }
-      }
-    } catch {
-      // Fall through
-    }
   }
 
-  // Ashby has a public API
   if (atsName === "Ashby") {
-    const ashbyMatch = careersUrl.match(
-      /jobs\.ashbyhq\.com\/([^/?#]+)/i
-    );
+    const ashbyMatch = careersUrl.match(/jobs\.ashbyhq\.com\/([^/?#]+)/i);
     const slug = ashbyMatch ? ashbyMatch[1] : companySlug.toLowerCase();
     try {
       const res = await fetchWithTimeout(
         `https://api.ashbyhq.com/posting-api/job-board/${slug}`,
+        4000
       );
       if (res.ok) {
         const data = await res.json();
@@ -288,13 +289,13 @@ async function countJobsViaApi(
     }
   }
 
-  // Lever has a public JSON endpoint
   if (atsName === "Lever") {
     const leverMatch = careersUrl.match(/jobs\.lever\.co\/([^/?#]+)/i);
     const slug = leverMatch ? leverMatch[1] : companySlug.toLowerCase();
     try {
       const res = await fetchWithTimeout(
-        `https://api.lever.co/v0/postings/${slug}?mode=json`
+        `https://api.lever.co/v0/postings/${slug}?mode=json`,
+        4000
       );
       if (res.ok) {
         const data = await res.json();
@@ -310,12 +311,14 @@ async function countJobsViaApi(
   return null;
 }
 
-function countJobsFromHtml(html: string, atsName: string | null): number | null {
+function countJobsFromHtml(
+  html: string,
+  atsName: string | null
+): number | null {
   if (!html) return null;
 
   const $ = cheerio.load(html);
 
-  // ATS-specific selectors
   if (atsName === "Greenhouse") {
     const openings = $(".opening").length;
     if (openings > 0) return openings;
@@ -334,7 +337,9 @@ function countJobsFromHtml(html: string, atsName: string | null): number | null 
   }
 
   if (atsName === "SmartRecruiters") {
-    const jobs = $(".opening-job, .js-openings li, [class*='job-item']").length;
+    const jobs = $(
+      ".opening-job, .js-openings li, [class*='job-item']"
+    ).length;
     if (jobs > 0) return jobs;
   }
 
@@ -343,7 +348,6 @@ function countJobsFromHtml(html: string, atsName: string | null): number | null 
     if (jobs > 0) return jobs;
   }
 
-  // Generic approach: look for common job listing patterns
   const genericSelectors = [
     '[class*="job-listing"]',
     '[class*="job-item"]',
@@ -365,7 +369,6 @@ function countJobsFromHtml(html: string, atsName: string | null): number | null 
     if (count > 0) return count;
   }
 
-  // Last resort: count links that look like job detail pages
   const jobLinks = new Set<string>();
   $("a[href]").each((_, el) => {
     const href = $(el).attr("href") || "";
@@ -401,7 +404,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Normalize URL
     let normalizedUrl = url.trim();
     if (
       !normalizedUrl.startsWith("http://") &&
@@ -423,7 +425,6 @@ export async function POST(request: NextRequest) {
     const baseUrl = `${parsedUrl.protocol}//${parsedUrl.hostname}`;
     const companyName = extractCompanyName(normalizedUrl);
 
-    // Find careers page
     const careersPage = await findCareersPage(baseUrl);
 
     let atsDetected = "Unknown / Custom ATS";
@@ -433,69 +434,43 @@ export async function POST(request: NextRequest) {
     if (careersPage) {
       careersUrl = careersPage.url;
 
-      // Detect ATS from the careers page URL first
       const atsFromUrl = detectAtsFromUrl(careersPage.url);
       if (atsFromUrl) {
         atsDetected = atsFromUrl;
       } else {
-        // Try detecting from the HTML content
         const atsFromHtml = detectAtsFromHtml(careersPage.html);
         if (atsFromHtml) {
           atsDetected = atsFromHtml;
         }
       }
 
-      // If the careers page links to an external ATS, try fetching that too
+      // If careers page links to an external ATS, detect it
       if (!atsFromUrl && careersPage.html) {
         const $ = cheerio.load(careersPage.html);
-        const externalAtsLinks: string[] = [];
         $("a[href], iframe[src]").each((_, el) => {
+          if (atsDetected !== "Unknown / Custom ATS") return;
           const href = $(el).attr("href") || $(el).attr("src") || "";
-          if (detectAtsFromUrl(href)) {
-            externalAtsLinks.push(href);
+          const ats = detectAtsFromUrl(href);
+          if (ats) {
+            atsDetected = ats;
+            careersUrl = href;
           }
         });
-
-        if (externalAtsLinks.length > 0) {
-          const atsUrl = externalAtsLinks[0];
-          atsDetected = detectAtsFromUrl(atsUrl) || atsDetected;
-          careersUrl = atsUrl;
-
-          try {
-            const atsRes = await fetchWithTimeout(atsUrl);
-            if (atsRes.ok) {
-              const atsHtml = await atsRes.text();
-              const atsJobCount = countJobsFromHtml(atsHtml, atsDetected);
-              if (atsJobCount !== null) {
-                liveRoles = atsJobCount;
-              }
-              careersUrl = atsRes.url;
-            }
-          } catch {
-            // Keep what we have
-          }
-        }
       }
+    }
 
-      // Try API-based job counting (most reliable for supported ATS)
-      if (atsDetected !== "Unknown / Custom ATS") {
-        const apiCount = await countJobsViaApi(
-          careersUrl || careersPage.url,
-          atsDetected,
-          companyName
-        );
-        if (apiCount !== null) {
-          liveRoles = apiCount;
-        }
-      }
+    // Try API-based job counting (most reliable)
+    if (atsDetected !== "Unknown / Custom ATS") {
+      liveRoles = await countJobsViaApi(
+        careersUrl || baseUrl,
+        atsDetected,
+        companyName
+      );
+    }
 
-      // Fall back to HTML scraping if API didn't work
-      if (liveRoles === null) {
-        liveRoles = countJobsFromHtml(
-          careersPage.html,
-          atsFromUrl || detectAtsFromHtml(careersPage.html)
-        );
-      }
+    // Fall back to HTML scraping
+    if (liveRoles === null && careersPage?.html) {
+      liveRoles = countJobsFromHtml(careersPage.html, atsDetected);
     }
 
     const linkedinSearchUrl = buildLinkedInSearchUrl(companyName);
